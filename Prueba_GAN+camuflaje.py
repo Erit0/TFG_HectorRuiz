@@ -329,20 +329,15 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
     if 'Fwd Header Length' in df_base.columns:
         # 1. Alineación TCP: Forzar que sea múltiplo de 4
         raw_header = df_base['Fwd Header Length']
-        # Dividimos entre 4, redondeamos y multiplicamos por 4
         header_aligned = np.round(raw_header / 4.0) * 4.0
         df_base['Fwd Header Length'] = header_aligned.astype(int)
 
         # 2. Recalcular Total Fwd Packets si es necesario
         if 'Total Fwd Packets' in df_base.columns:
             new_header_len = df_base['Fwd Header Length']
-            # Asumimos 32 bytes promedio por cabecera
             estimated_packets = np.ceil(new_header_len / 32.0).astype(int)
-            
-            # No podemos tener menos paquetes de los que ya había (no comprimimos)
             original_packets = df_base['Total Fwd Packets']
             final_packets = np.maximum(original_packets, estimated_packets)
-            
             print("    -> Recalculando 'Total Fwd Packets' (Alineado/32) para consistencia...")
             df_base['Total Fwd Packets'] = final_packets
 
@@ -351,59 +346,51 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
         
         gan_mean = df_base['Packet Length Mean']
         
-        # Recuperar valores inamovibles (Víctima)
         bwd_len = df_base['Total Length of Bwd Packets'] if 'Total Length of Bwd Packets' in df_base.columns else 0
         bwd_pkts = df_base['Total Backward Packets'] if 'Total Backward Packets' in df_base.columns else 0
-        
-        # Recuperar Total Fwd Packets (el cual ya incluye los posibles ajustes del paso B)
         fwd_pkts = df_base['Total Fwd Packets'] if 'Total Fwd Packets' in df_base.columns else 1
-        
         total_pkts = fwd_pkts + bwd_pkts
         
-        # Despejar la carga útil del atacante: Total Fwd Len = (Mean * Total Pkts) - Total Bwd Len
         new_fwd_len = (gan_mean * total_pkts) - bwd_len
-        
-        # Límite Inferior: Mayor o igual a cero
         new_fwd_len = np.maximum(new_fwd_len, 0)
-        
-        # Límite Superior Físico: Payload máximo por paquete Fwd (MTU Ethernet estándar ~ 1460 bytes)
         max_fwd_len_allowed = fwd_pkts * 1460
         new_fwd_len = np.minimum(new_fwd_len, max_fwd_len_allowed)
         
-        # Aplicar el nuevo valor calculado
         df_base['Total Length of Fwd Packets'] = np.round(new_fwd_len).astype(int)
-        
-        # Recalcular el Mean definitivo por si hemos tenido que hacer clipping por MTU o negativos
         df_base['Packet Length Mean'] = (df_base['Total Length of Fwd Packets'] + bwd_len) / np.maximum(total_pkts, 1)
         
-        # ==========================================================
-        # ★ SINCRONIZAR COLUMNAS FWD HERMANAS (Para engañar al RF) ★
-        # ==========================================================
-        
-        # 1. Actualizar la Media de los paquetes Fwd
         if 'Fwd Packet Length Mean' in df_base.columns:
             df_base['Fwd Packet Length Mean'] = df_base['Total Length of Fwd Packets'] / np.maximum(fwd_pkts, 1)
-            
-        # 2. Avg Fwd Segment Size (Es un clon de Fwd Packet Length Mean)
         if 'Avg Fwd Segment Size' in df_base.columns:
             df_base['Avg Fwd Segment Size'] = df_base['Fwd Packet Length Mean']
-            
-        # 3. Average Packet Size (Clon de Packet Length Mean)
         if 'Average Packet Size' in df_base.columns:
             df_base['Average Packet Size'] = df_base['Packet Length Mean']
-            
-        # 4. Lógica Jerárquica FWD (Máximos)
         if 'Fwd Packet Length Max' in df_base.columns and 'Fwd Packet Length Mean' in df_base.columns:
             df_base['Fwd Packet Length Max'] = np.maximum(df_base['Fwd Packet Length Max'], df_base['Fwd Packet Length Mean']).astype(int)
-            
         if 'Max Packet Length' in df_base.columns and 'Fwd Packet Length Max' in df_base.columns:
             df_base['Max Packet Length'] = np.maximum(df_base['Max Packet Length'], df_base['Fwd Packet Length Max']).astype(int)
             
         print("    -> [PAYLOAD] Matemáticas de Payload y columnas hermanas sincronizadas 100%.")
 
+    # --- D) Coherencia Flow Duration e IAT Totals ---
+    # Cuando la GAN modifica Flow IAT Mean, recalculamos Flow Duration,
+    # Fwd IAT Total y Bwd IAT Total para que sean consistentes.
+    if 'Flow IAT Mean' in df_base.columns:
+        total_pkts = df_base['Total Fwd Packets'] + df_base['Total Backward Packets']
+        intervalos = np.maximum(total_pkts - 1, 1)
+        df_base['Flow Duration'] = (df_base['Flow IAT Mean'] * intervalos).round().astype(int)
+        if 'Fwd IAT Total' in df_base.columns:
+            fwd_intervalos = np.maximum(df_base['Total Fwd Packets'] - 1, 0)
+            df_base['Fwd IAT Total'] = (df_base['Flow IAT Mean'] * fwd_intervalos).round().astype(int)
+        if 'Bwd IAT Total' in df_base.columns:
+            bwd_intervalos = np.maximum(df_base['Total Backward Packets'] - 1, 0)
+            df_base['Bwd IAT Total'] = (df_base['Flow IAT Mean'] * bwd_intervalos).round().astype(int)
+        print("    -> [IAT] Flow Duration, Fwd IAT Total y Bwd IAT Total recalculados.")
+
     # 6. SANITIZACIÓN FINAL
     df_base = df_base.replace([np.inf, -np.inf], 1e9).fillna(0)
     return df_base, df_shap_fixed
+
 # ==========================================
 # 5. VALIDACIÓN RF
 # ==========================================

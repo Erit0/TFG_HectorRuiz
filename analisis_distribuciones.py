@@ -86,6 +86,29 @@ HATCHES = [
     '--',    # 14
 ]
 
+# Estilos de línea para reforzar la distinción entre ataques
+LINESTYLES = ['-', '--', '-.', ':', '-', '--', '-.', ':', '-', '--', '-.', ':', '-', '--']
+
+# ==========================================
+# LÍMITES FIJOS DEL EJE X
+# Calculados sobre el dataset completo para que sean comparables
+# cuando se ejecute sobre muestras o subconjuntos distintos
+# ==========================================
+XLIM_FIJOS = {
+    'Init_Win_bytes_forward':      65535.00,
+    'Init_Win_bytes_backward':     42780.00,
+    'Bwd Packet Length Min':         248.00,
+    'Fwd Header Length':            1328.00,
+    'Bwd Packet Length Std':        4128.32,
+    'Bwd Packet Length Mean':       2321.40,
+    'Avg Bwd Segment Size':         2321.40,
+    'Bwd Packet Length Max':        8760.00,
+    'Packet Length Mean':           1292.56,
+    'Max Packet Length':           10135.00,
+    'Total Length of Bwd Packets': 71831.00,
+    'Flow IAT Mean':            21400000.00,
+}
+
 # ==========================================
 # FUNCIONES
 # ==========================================
@@ -165,6 +188,12 @@ def generar_graficos_lineales(ruta_directorio):
         return
 
     df_total = pd.concat(lista_dfs, ignore_index=True)
+
+    # Limpiar caracteres especiales de las etiquetas
+    # Ej: "Web Attack → Brute Force" → "Web Attack Brute Force"
+    df_total['Label'] = df_total['Label'].str.encode('ascii', 'ignore').str.decode('ascii').str.strip()
+    df_total['Label'] = df_total['Label'].str.replace(r'\s+', ' ', regex=True)
+
     print(f"[*] Total flujos cargados: {len(df_total):,}")
 
     cols_a_graficar = [c for c in FEATURES_TO_PLOT if c in df_total.columns]
@@ -187,7 +216,11 @@ def generar_graficos_lineales(ruta_directorio):
             continue
 
         max_real = all_values.max()
-        limite_superior = np.percentile(all_values, 99)
+        # Usar límite fijo si está definido, si no calcular con percentil 99
+        if feature_name in XLIM_FIJOS:
+            limite_superior = XLIM_FIJOS[feature_name]
+        else:
+            limite_superior = np.percentile(all_values, 99)
         if limite_superior <= 0:
             limite_superior = max_real
         if limite_superior <= 0:
@@ -210,23 +243,38 @@ def generar_graficos_lineales(ruta_directorio):
 
         for etiqueta, data, count in conteo_clases:
             data_visible = data[data <= limite_superior]
-            # Normalización: proporción respecto al TOTAL de esa clase
-            # (no respecto a los visibles) → comparable entre clases
             weights = np.ones_like(data_visible) / len(data)
-
             color, hatch = estilos.get(etiqueta, (PALETTE[1], HATCHES[1]))
 
-            ax.hist(
-                data_visible,
-                bins=bins_fijos,
-                weights=weights,
-                alpha=0.55,
-                label=etiqueta,
-                color=color,
-                hatch=hatch,
-                edgecolor='black',
-                linewidth=0.6,
-            )
+            es_benign = 'BENIGN' in etiqueta.upper()
+
+            if es_benign:
+                # BENIGN: relleno muy suave de fondo, no compite con los ataques
+                ax.hist(
+                    data_visible,
+                    bins=bins_fijos,
+                    weights=weights,
+                    histtype='stepfilled',
+                    alpha=0.15,
+                    label=etiqueta,
+                    color=color,
+                    edgecolor=color,
+                    linewidth=1.5,
+                )
+            else:
+                # ATAQUES: relleno semitransparente + borde grueso del mismo color
+                ax.hist(
+                    data_visible,
+                    bins=bins_fijos,
+                    weights=weights,
+                    histtype='stepfilled',
+                    alpha=0.35,
+                    label=etiqueta,
+                    color=color,
+                    edgecolor=color,
+                    linewidth=2.2,
+                    hatch=hatch,
+                )
 
         # ── Título y ejes ────────────────────────────────────────────────────
         ax.set_title(
@@ -238,16 +286,14 @@ def generar_graficos_lineales(ruta_directorio):
         ax.set_ylabel("Frecuencia Relativa (Proporción por clase)", fontsize=11)
         ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y, _: f'{y:g}'))
 
-        # ── Leyenda en 2 columnas fuera del área del gráfico ─────────────────
-        # Así nunca tapa las barras
+        # ── Leyenda fuera del área del gráfico ───────────────────────────────
         handles, labels_leg = ax.get_legend_handles_labels()
-        # Invertimos para que BENIGN quede arriba
         ax.legend(
             list(reversed(handles)),
             list(reversed(labels_leg)),
             title="Tipo de Tráfico",
             loc='upper left',
-            bbox_to_anchor=(1.01, 1),  # fuera del plot, a la derecha
+            bbox_to_anchor=(1.01, 1),
             borderaxespad=0,
             ncol=1,
             fontsize=8.5,
@@ -257,6 +303,7 @@ def generar_graficos_lineales(ruta_directorio):
 
         ax.grid(True, which='both', ls='--', alpha=0.25)
         ax.spines[['top', 'right']].set_visible(False)
+        ax.set_xlim(0, limite_superior)
 
         filename = f"grafico_lineal_{feature_name.replace(' ', '_')}.png"
         fig.tight_layout()

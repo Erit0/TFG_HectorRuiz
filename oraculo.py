@@ -52,14 +52,15 @@ def preprocess_csv(df):
     # 1. Limpiar espacios en los nombres de las columnas
     df_clean.columns = df_clean.columns.str.strip()
     
-    # Renombrar columnas si CICFlowMeter usó la versión corta (Src IP en vez de Source IP)
+    # Renombrar columnas si CICFlowMeter usó la versión corta
     df_clean.rename(columns=nombres_alternativos, inplace=True)
     
     # 2. Eliminar las columnas basura
     columnas_a_borrar = [col for col in columnas_basura if col in df_clean.columns]
     df_clean = df_clean.drop(columns=columnas_a_borrar, errors='ignore')
     
-    # 3. Eliminar la columna 'Label' si CICFlowMeter la ha añadido por defecto
+    # 3. Eliminar la columna 'Label' temporalmente SOLO para hacer la predicción
+    # (El Random Forest no puede ver la etiqueta para predecir)
     label_cols = [c for c in df_clean.columns if 'label' in c.lower()]
     if label_cols:
         df_clean = df_clean.drop(columns=label_cols)
@@ -105,8 +106,12 @@ def main():
         print(f"[*] Analizando flujo: {os.path.basename(archivo)}")
         
         try:
-            # 1. Leer y limpiar
+            # 1. Leer y limpiar (la limpieza borra la label para la IA, pero df_original la conserva)
             df_original = pd.read_csv(archivo)
+            
+            # Quitar posibles espacios en los nombres de las columnas del original
+            df_original.columns = df_original.columns.str.strip()
+            
             X_clean = preprocess_csv(df_original)
             
             # 2. Alinear características
@@ -129,10 +134,21 @@ def main():
             else:
                 print("    -> [❌] ATAQUE DETECTADO. El modelo no ha sido engañado.")
             
-            # 5. Guardar el archivo con la predicción
+            # 5. Guardar el archivo modificando la columna 'Label'
             df_resultado = df_original.copy()
-            df_resultado['PREDICCION_RF'] = y_pred_labels
             
+            # Buscar si existe alguna columna que se llame 'Label', 'label', ' LABEL ', etc.
+            label_col_existe = [c for c in df_resultado.columns if 'label' in c.lower()]
+            
+            if label_col_existe:
+                # Si existe, machacamos la primera que encuentre con las nuevas predicciones
+                col_name = label_col_existe[0]
+                df_resultado[col_name] = y_pred_labels
+            else:
+                # Si por algún motivo el CSV original no traía columna Label, la creamos
+                df_resultado['Label'] = y_pred_labels
+            
+            # Guardamos el archivo final
             nombre_salida = archivo.replace(".csv", "_PREDICCION.csv")
             df_resultado.to_csv(nombre_salida, index=False)
             print(f"    -> [✓] Guardado informe en: {nombre_salida}")
