@@ -372,22 +372,74 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
             
         print("    -> [PAYLOAD] Matemáticas de Payload y columnas hermanas sincronizadas 100%.")
 
-    # --- D) Coherencia Flow Duration e IAT Totals ---
-    # Cuando la GAN modifica Flow IAT Mean, recalculamos Flow Duration,
-    # Fwd IAT Total y Bwd IAT Total para que sean consistentes.
+    # --- D) Coherencia Flow Duration e IAT (MODELO PING-PONG / REALISTA) ---
     if 'Flow IAT Mean' in df_base.columns:
         total_pkts = df_base['Total Fwd Packets'] + df_base['Total Backward Packets']
-        intervalos = np.maximum(total_pkts - 1, 1)
-        df_base['Flow Duration'] = (df_base['Flow IAT Mean'] * intervalos).round().astype(int)
-        if 'Fwd IAT Total' in df_base.columns:
-            fwd_intervalos = np.maximum(df_base['Total Fwd Packets'] - 1, 0)
-            df_base['Fwd IAT Total'] = (df_base['Flow IAT Mean'] * fwd_intervalos).round().astype(int)
-        if 'Bwd IAT Total' in df_base.columns:
-            bwd_intervalos = np.maximum(df_base['Total Backward Packets'] - 1, 0)
-            df_base['Bwd IAT Total'] = (df_base['Flow IAT Mean'] * bwd_intervalos).round().astype(int)
-        print("    -> [IAT] Flow Duration, Fwd IAT Total y Bwd IAT Total recalculados.")
+        intervalos  = np.maximum(total_pkts - 1, 1)
+        fwd_intervalos = np.maximum(df_base['Total Fwd Packets'] - 1, 0)
+        bwd_intervalos = np.maximum(df_base['Total Backward Packets'] - 1, 0)
 
-    # 6. SANITIZACIÓN FINAL
+        # 1. Calculamos la duración teórica que quiere la GAN
+        duracion_teorica = df_base['Flow IAT Mean'] * intervalos
+        
+        # 2. Forzamos el límite estricto de CICFlowMeter (Topamos a 119.9 segundos)
+        df_base['Flow Duration'] = np.minimum(duracion_teorica, 119990000).round().astype(int)
+        
+        # 3. Recalculamos el Flow IAT Mean real para que cuadre perfectamente con el tope
+        df_base['Flow IAT Mean'] = df_base['Flow Duration'] / intervalos
+
+        # 4. LA MAGIA DEL PING-PONG (Tiempos Concurrentes, no sumados)
+        # Rescatamos los valores que pidió la GAN originalmente
+        fwd_raw = df_shap_fixed['Fwd IAT Total'] if 'Fwd IAT Total' in df_shap_fixed.columns else df_base['Fwd IAT Total']
+        bwd_raw = df_shap_fixed['Bwd IAT Total'] if 'Bwd IAT Total' in df_shap_fixed.columns else df_base['Bwd IAT Total']
+
+        # En TCP real entrelazado, el Flow Duration lo marca la dirección que más tarda.
+        # Buscamos quién es el más lento (Max) y sacamos una proporción para escalar.
+        max_raw = np.maximum(np.maximum(fwd_raw, bwd_raw), 1)
+        ratio_escala = df_base['Flow Duration'] / max_raw
+
+        # Escalamos ambos cronómetros (Ahora el mayor será EXACTAMENTE igual al Flow Duration)
+        fwd_iat_total_nuevo = (fwd_raw * ratio_escala).round().astype(int)
+        bwd_iat_total_nuevo = (bwd_raw * ratio_escala).round().astype(int)
+
+        if 'Fwd IAT Total' in df_base.columns:
+            df_base['Fwd IAT Total'] = fwd_iat_total_nuevo
+        if 'Bwd IAT Total' in df_base.columns:
+            df_base['Bwd IAT Total'] = bwd_iat_total_nuevo
+
+        # 5. Recalcular las medias direccionales
+        fwd_iat_mean_nuevo = fwd_iat_total_nuevo / np.maximum(fwd_intervalos, 1)
+        bwd_iat_mean_nuevo = bwd_iat_total_nuevo / np.maximum(bwd_intervalos, 1)
+
+        # 6. Actualizar FWD IAT (Std, Mean, Max, Min) con redondeos seguros
+        if 'Fwd IAT Std' in df_base.columns and 'Fwd IAT Mean' in df_base.columns:
+            old_mean_fwd = df_base['Fwd IAT Mean'].replace(0, 1)
+            ratio_fwd = fwd_iat_mean_nuevo / old_mean_fwd
+            df_base['Fwd IAT Std'] = (df_base['Fwd IAT Std'] * ratio_fwd).clip(lower=0).round(2)
+            
+        if 'Fwd IAT Mean' in df_base.columns:
+            df_base['Fwd IAT Mean'] = fwd_iat_mean_nuevo.round(2)
+        if 'Fwd IAT Max' in df_base.columns:
+            df_base['Fwd IAT Max'] = np.maximum(df_base['Fwd IAT Max'], np.ceil(fwd_iat_mean_nuevo)).astype(int)
+        if 'Fwd IAT Min' in df_base.columns:
+            df_base['Fwd IAT Min'] = np.minimum(df_base['Fwd IAT Min'], np.floor(fwd_iat_mean_nuevo)).astype(int)
+
+        # 7. Actualizar BWD IAT (Std, Mean, Max, Min) con redondeos seguros
+        if 'Bwd IAT Std' in df_base.columns and 'Bwd IAT Mean' in df_base.columns:
+            old_mean_bwd = df_base['Bwd IAT Mean'].replace(0, 1)
+            ratio_bwd = bwd_iat_mean_nuevo / old_mean_bwd
+            df_base['Bwd IAT Std'] = (df_base['Bwd IAT Std'] * ratio_bwd).clip(lower=0).round(2)
+            
+        if 'Bwd IAT Mean' in df_base.columns:
+            df_base['Bwd IAT Mean'] = bwd_iat_mean_nuevo.round(2)
+        if 'Bwd IAT Max' in df_base.columns:
+            df_base['Bwd IAT Max'] = np.maximum(df_base['Bwd IAT Max'], np.ceil(bwd_iat_mean_nuevo)).astype(int)
+        if 'Bwd IAT Min' in df_base.columns:
+            df_base['Bwd IAT Min'] = np.minimum(df_base['Bwd IAT Min'], np.floor(bwd_iat_mean_nuevo)).astype(int)
+
+        print("    -> [IAT] Modelo PING-PONG activado: Flow Duration dictado por el máximo concurrente (NO por la suma).")
+
+    # 6. SANITIZACIÓN FINAL Y RETURN (Indentado a la altura del IF)
     df_base = df_base.replace([np.inf, -np.inf], 1e9).fillna(0)
     return df_base, df_shap_fixed
 
