@@ -68,7 +68,7 @@ columnas_basura = [
 
 
 # ==========================================
-# 0. FILTRO DE APLICABILIDAD  ← NUEVO
+# 0. FILTRO DE APLICABILIDAD
 # ==========================================
 def filtrar_flujos_aplicables(df):
     """
@@ -132,29 +132,57 @@ def cargar_datos_completos():
     # ── Ataques ───────────────────────────────────────────────────────────
     df_attacks_full = df_full[df_full[label_col] != 'BENIGN'].dropna()
 
-    # FILTRO DE APLICABILIDAD: solo flujos físicamente coherentes ← NUEVO
+    # FILTRO DE APLICABILIDAD: solo flujos físicamente coherentes
     df_attacks_full = filtrar_flujos_aplicables(df_attacks_full)
 
-# Muestreo reproducible ESTRATIFICADO DESPUÉS del filtro
-    # Esto garantiza que todos los tipos de ataque estén representados
-    if len(df_attacks_full) > CANTIDAD_ATAQUES:
-        try:
-            from sklearn.model_selection import train_test_split
-            # Extraemos una muestra del tamaño deseado, manteniendo las proporciones (stratify)
-            _, df_attacks_full = train_test_split(
-                df_attacks_full,
-                test_size=CANTIDAD_ATAQUES,
-                random_state=SEMILLA,
-                stratify=df_attacks_full[label_col]
-            )
-        except ValueError:
-            # Fallback de seguridad: Si un ataque tiene solo 1 muestra, train_test_split falla.
-            # En ese caso, forzamos a coger 1 de cada tipo manualmente y rellenamos el resto.
-            tipos = df_attacks_full[label_col].unique()
-            df_obligatorios = df_attacks_full.groupby(label_col).sample(n=1, random_state=SEMILLA)
-            restantes = CANTIDAD_ATAQUES - len(df_obligatorios)
-            df_resto = df_attacks_full.drop(df_obligatorios.index).sample(n=restantes, random_state=SEMILLA)
-            df_attacks_full = pd.concat([df_obligatorios, df_resto]).sample(frac=1, random_state=SEMILLA) # Mezclar
+    # ── MUESTREO: mínimo 30 por tipo, hasta CANTIDAD_ATAQUES total ────────
+    MIN_POR_TIPO = 30
+
+    # 1. Garantizar mínimo 30 de cada tipo (con reemplazo si hacen falta)
+    partes = []
+    for tipo, grupo in df_attacks_full.groupby(label_col):
+        if len(grupo) >= MIN_POR_TIPO:
+            partes.append(grupo.sample(n=MIN_POR_TIPO, random_state=SEMILLA))
+        else:
+            partes.append(grupo.sample(n=MIN_POR_TIPO, random_state=SEMILLA, replace=True))
+            print(f"    [!] '{tipo}': solo {len(grupo)} muestras → rellenado con repetición hasta {MIN_POR_TIPO}")
+
+    df_obligatorio    = pd.concat(partes, ignore_index=True)
+    cuota_obligatoria = len(df_obligatorio)
+    print(f"[✓] Cuota mínima garantizada: {cuota_obligatoria} filas ({len(partes)} tipos × {MIN_POR_TIPO})")
+
+    # 2. Rellenar hasta CANTIDAD_ATAQUES con el resto disponible (o aleatorio con reemplazo)
+    restantes_necesarios = CANTIDAD_ATAQUES - cuota_obligatoria
+
+    if restantes_necesarios > 0:
+        indices_usados = set(df_obligatorio.index) & set(df_attacks_full.index)
+        df_pool        = df_attacks_full.drop(index=list(indices_usados), errors='ignore')
+
+        if len(df_pool) >= restantes_necesarios:
+            try:
+                from sklearn.model_selection import train_test_split
+                _, df_relleno = train_test_split(
+                    df_pool,
+                    test_size=restantes_necesarios,
+                    random_state=SEMILLA,
+                    stratify=df_pool[label_col]
+                )
+            except ValueError:
+                df_relleno = df_pool.sample(n=restantes_necesarios, random_state=SEMILLA)
+        else:
+            print(f"    [!] Pool insuficiente ({len(df_pool)}) → relleno aleatorio con reemplazo")
+            df_relleno = df_attacks_full.sample(n=restantes_necesarios, random_state=SEMILLA, replace=True)
+
+        df_attacks_full = pd.concat([df_obligatorio, df_relleno], ignore_index=True)
+    else:
+        df_attacks_full = df_obligatorio
+
+    # Mezclar para que no queden agrupados por tipo
+    df_attacks_full = df_attacks_full.sample(frac=1, random_state=SEMILLA).reset_index(drop=True)
+
+    print(f"[✓] Dataset final de ataques: {len(df_attacks_full)} filas")
+    tipos_finales = df_attacks_full[label_col].value_counts()
+    print(tipos_finales.to_string())
 
     df_attacks_shap = df_attacks_full[SHAP_FEATURES].copy()
 
@@ -201,13 +229,13 @@ def get_feature_indices():
 
 def construir_generador(input_dim, limites_tensor):
     idx_min, idx_mean, idx_max = get_feature_indices()
-    inp        = layers.Input(shape=(input_dim,), name="Input_Attack")
-    x          = layers.Dense(64, activation='relu')(inp)
-    x          = layers.BatchNormalization()(x)
-    x          = layers.Dense(64, activation='relu')(x)
-    delta_raw  = layers.Dense(input_dim, activation='tanh')(x)
+    inp          = layers.Input(shape=(input_dim,), name="Input_Attack")
+    x            = layers.Dense(64, activation='relu')(inp)
+    x            = layers.BatchNormalization()(x)
+    x            = layers.Dense(64, activation='relu')(x)
+    delta_raw    = layers.Dense(input_dim, activation='tanh')(x)
     delta_scaled = layers.Multiply(name="Escalar_Limites")([delta_raw, limites_tensor])
-    modified   = layers.Add()([inp, delta_scaled])
+    modified     = layers.Add()([inp, delta_scaled])
     final_output = HierarchicalLogicLayer(idx_min, idx_mean, idx_max)([inp, modified])
     final_output = layers.Lambda(lambda z: K.clip(z, 0.0, 1.0))(final_output)
     return models.Model(inp, final_output)
@@ -258,8 +286,8 @@ def entrenar_gan(df_benign, df_attacks_shap, df_attacks_full_orig):
         pass
 
     # Contexto para auditoría
-    audit_size         = len(X_attacks)
-    X_audit_raw        = X_attacks[:audit_size]
+    audit_size            = len(X_attacks)
+    X_audit_raw           = X_attacks[:audit_size]
     df_audit_full_context = df_attacks_full_orig.iloc[:audit_size].reset_index(drop=True)
 
     best_evasion = 0.0
@@ -334,7 +362,7 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
     print("[*] Aplicando limpieza y CÁLCULO INVERSO de paquetes...")
 
     # 1. LIMPIEZA
-    df_base      = df_full_original.drop(columns=columnas_basura, errors='ignore').copy().reset_index(drop=True)
+    df_base = df_full_original.drop(columns=columnas_basura, errors='ignore').copy().reset_index(drop=True)
 
     # 2. REPARACIÓN NUMÉRICA BÁSICA
     df_shap_fixed = df_shap_modificado.copy()
@@ -384,14 +412,14 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
         new_packet_count = np.maximum(np.round(gan_total_len / gan_mean_safe).astype(int), 1)
         mask_zero_len    = (gan_total_len == 0)
         if 'Total Backward Packets' in df_base.columns:
-            original_count       = df_base['Total Backward Packets']
-            new_packet_count     = np.where(mask_zero_len, original_count, new_packet_count)
+            original_count   = df_base['Total Backward Packets']
+            new_packet_count = np.where(mask_zero_len, original_count, new_packet_count)
             print("    -> Recalculando 'Total Backward Packets' para consistencia matemática...")
             df_base['Total Backward Packets'] = new_packet_count
 
     # --- B) Coherencia Forward (alineación TCP + Header/32) ---
     if 'Fwd Header Length' in df_base.columns:
-        header_aligned        = np.round(df_base['Fwd Header Length'] / 4.0) * 4.0
+        header_aligned           = np.round(df_base['Fwd Header Length'] / 4.0) * 4.0
         df_base['Fwd Header Length'] = header_aligned.astype(int)
         if 'Total Fwd Packets' in df_base.columns:
             estimated_packets        = np.ceil(df_base['Fwd Header Length'] / 32.0).astype(int)
@@ -400,10 +428,10 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
 
     # --- C) Coherencia Packet Length Mean (despejar Fwd payload y sincronizar) ---
     if 'Packet Length Mean' in df_base.columns and 'Total Length of Fwd Packets' in df_base.columns:
-        gan_mean  = df_base['Packet Length Mean']
-        bwd_len   = df_base.get('Total Length of Bwd Packets', 0)
-        bwd_pkts  = df_base.get('Total Backward Packets', 0)
-        fwd_pkts  = df_base.get('Total Fwd Packets', pd.Series([1] * len(df_base)))
+        gan_mean   = df_base['Packet Length Mean']
+        bwd_len    = df_base.get('Total Length of Bwd Packets', 0)
+        bwd_pkts   = df_base.get('Total Backward Packets', 0)
+        fwd_pkts   = df_base.get('Total Fwd Packets', pd.Series([1] * len(df_base)))
         total_pkts = fwd_pkts + bwd_pkts
 
         new_fwd_len = np.maximum((gan_mean * total_pkts) - bwd_len, 0)
@@ -431,7 +459,7 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
 
         print("    -> [PAYLOAD] Payload y columnas hermanas sincronizadas.")
 
-# --- D) Coherencia Flow Duration e IAT (modelo ping-pong) ---
+    # --- D) Coherencia Flow Duration e IAT (modelo ping-pong) ---
     if 'Flow IAT Mean' in df_base.columns:
         fwd_pkts       = df_base['Total Fwd Packets']
         bwd_pkts       = df_base['Total Backward Packets']
@@ -443,9 +471,9 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
         # Escalar OLD_Flow_Duration por el ratio de cambio del IAT
         # Evita heredar la incoherencia del dataset original
         # (CIC-IDS-2017 tiene flujos donde IAT_Mean * intervalos != Flow_Duration)
-        iat_old_safe  = np.maximum(df_shap_original['Flow IAT Mean'].values, 1)
-        iat_new       = df_base['Flow IAT Mean'].values
-        ratio_cambio  = iat_new / iat_old_safe
+        iat_old_safe = np.maximum(df_shap_original['Flow IAT Mean'].values, 1)
+        iat_new      = df_base['Flow IAT Mean'].values
+        ratio_cambio = iat_new / iat_old_safe
 
         dur_old = (df_shap_original['Flow Duration'].values
                    if 'Flow Duration' in df_shap_original.columns
@@ -510,39 +538,51 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
         print("    -> [IAT] Flow Duration escalado desde original × ratio_IAT "
               "(sin herencia de incoherencias del dataset).")
 
-    # ==========================================
-    # --- E) RECALCULAR VELOCIDADES (CAUSA 3) ---
-    # ==========================================
+    # --- E) RECALCULAR VELOCIDADES ---
     # Flow Packets/s = Total Packets / (Flow Duration en segundos)
-    # Flow Bytes/s   = Total Bytes / (Flow Duration en segundos)
-    
+    # Flow Bytes/s   = Total Bytes   / (Flow Duration en segundos)
     if 'Flow Duration' in df_base.columns:
         duracion_segundos = df_base['Flow Duration'] / 1_000_000.0
-        # Evitar división por cero
-        duracion_segundos = np.maximum(duracion_segundos, 1e-6)
-        
-        fwd_pkts  = df_base.get('Total Fwd Packets', 0)
-        bwd_pkts  = df_base.get('Total Backward Packets', 0)
-        total_pkts = fwd_pkts + bwd_pkts
-        
-        fwd_bytes = df_base.get('Total Length of Fwd Packets', 0)
-        bwd_bytes = df_base.get('Total Length of Bwd Packets', 0)
+        duracion_segundos = np.maximum(duracion_segundos, 1e-6)  # evitar div/0
+
+        fwd_pkts    = df_base.get('Total Fwd Packets',             0)
+        bwd_pkts    = df_base.get('Total Backward Packets',        0)
+        total_pkts  = fwd_pkts + bwd_pkts
+        fwd_bytes   = df_base.get('Total Length of Fwd Packets',   0)
+        bwd_bytes   = df_base.get('Total Length of Bwd Packets',   0)
         total_bytes = fwd_bytes + bwd_bytes
 
         if 'Flow Packets/s' in df_base.columns:
-            df_base['Flow Packets/s'] = total_pkts / duracion_segundos
-            
+            df_base['Flow Packets/s'] = total_pkts  / duracion_segundos
         if 'Flow Bytes/s' in df_base.columns:
-            df_base['Flow Bytes/s'] = total_bytes / duracion_segundos
-            
+            df_base['Flow Bytes/s']   = total_bytes / duracion_segundos
         if 'Fwd Packets/s' in df_base.columns:
-            df_base['Fwd Packets/s'] = fwd_pkts / duracion_segundos
-            
+            df_base['Fwd Packets/s']  = fwd_pkts    / duracion_segundos
         if 'Bwd Packets/s' in df_base.columns:
-            df_base['Bwd Packets/s'] = bwd_pkts / duracion_segundos
-            
+            df_base['Bwd Packets/s']  = bwd_pkts    / duracion_segundos
+
         print("    -> [SPEED] Velocidades (Bytes/s, Pkts/s) recalculadas para coherencia total.")
-        
+
+    # --- F) GARANTÍA FINAL: Fwd Min ≤ Mean ≤ Max  ← FIX ---
+    # El bloque C recalcula Fwd Packet Length Mean a partir de bytes/paquetes,
+    # lo que puede dejar Mean > Max o Min > Mean si los recálculos en cascada
+    # no convergen. Este bloque se ejecuta incondicionalmente al final para
+    # asegurar la invariante, igual que ya se hace para la dirección Backward
+    # en el paso 3 de este mismo función.
+    if 'Fwd Packet Length Mean' in df_base.columns:
+        fwd_mean = df_base['Fwd Packet Length Mean']
+        if 'Fwd Packet Length Max' in df_base.columns:
+            df_base['Fwd Packet Length Max'] = np.maximum(
+                df_base['Fwd Packet Length Max'], fwd_mean).astype(int)
+        if 'Fwd Packet Length Min' in df_base.columns:
+            df_base['Fwd Packet Length Min'] = np.minimum(
+                df_base['Fwd Packet Length Min'], fwd_mean).astype(int)
+        # Propagar Max Packet Length si quedó por debajo del nuevo Fwd Max
+        if 'Max Packet Length' in df_base.columns and 'Fwd Packet Length Max' in df_base.columns:
+            df_base['Max Packet Length'] = np.maximum(
+                df_base['Max Packet Length'], df_base['Fwd Packet Length Max']).astype(int)
+        print("    -> [FWD HIER] Invariante Fwd Min ≤ Mean ≤ Max garantizada.")
+
     # 6. SANITIZACIÓN FINAL
     df_base = df_base.replace([np.inf, -np.inf], 1e9).fillna(0)
     return df_base, df_shap_fixed
@@ -566,7 +606,7 @@ def validar_rf(df_final_limpio):
         for col in model_cols:
             X_test[col] = df_final_limpio[col] if col in df_final_limpio.columns else 0
 
-        X_test = X_test.replace([np.inf, -np.inf], 1e9).fillna(0).astype(np.float32)
+        X_test  = X_test.replace([np.inf, -np.inf], 1e9).fillna(0).astype(np.float32)
         preds   = model.predict(X_test)
         success = (preds == benign_lbl)
 
@@ -589,10 +629,10 @@ def main():
     print("[*] Generando perturbaciones finales...")
     X_adv = generator.predict(X_raw)
 
-    vals_orig      = scaler.inverse_transform(X_raw)
-    vals_adv       = scaler.inverse_transform(X_adv)
-    df_shap_orig   = pd.DataFrame(vals_orig, columns=SHAP_FEATURES)
-    df_shap_adv_raw = pd.DataFrame(vals_adv, columns=SHAP_FEATURES)
+    vals_orig       = scaler.inverse_transform(X_raw)
+    vals_adv        = scaler.inverse_transform(X_adv)
+    df_shap_orig    = pd.DataFrame(vals_orig, columns=SHAP_FEATURES)
+    df_shap_adv_raw = pd.DataFrame(vals_adv,  columns=SHAP_FEATURES)
 
     df_completo_limpio, df_shap_final = reparar_y_reconstruir(
         df_attacks_full_orig,
@@ -605,17 +645,12 @@ def main():
 
     reporte = pd.DataFrame()
     reporte['Archivo'] = df_attacks_full_orig['_ORIGIN_FILE_'].values
-    
-    # Recorremos TODAS las columnas del dataset final limpio (las 70+ columnas)
+
+    # Recorremos TODAS las columnas del dataset final limpio
     for col in df_completo_limpio.columns:
-        # Saltamos las columnas de metadatos internos
-        if col in ['_ORIGIN_FILE_', '_ORIGIN_IDX_']: 
-            continue 
-            
-        # Extraemos el valor original del dataset completo. Si no existía, ponemos 0.
+        if col in ['_ORIGIN_FILE_', '_ORIGIN_IDX_']:
+            continue
         reporte[f'OLD_{col}'] = df_attacks_full_orig[col].values if col in df_attacks_full_orig.columns else 0
-        
-        # Extraemos el valor nuevo del dataset reconstruido
         reporte[f'NEW_{col}'] = df_completo_limpio[col].values
 
     reporte.to_csv("REPORTE_GAN_COMPLETO.csv", index=False)

@@ -1,282 +1,655 @@
-import pandas as pd
-import numpy as np
+"""
+generador_de_trafico.py
+===============
+Genera una PCAP realista por flujo TCP a partir del CSV adversario.
+
+Lógica de temporización (PING-PONG real):
+  - Los paquetes Fwd y Bwd se entrelazan en orden cronológico real.
+  - Cada dirección lleva su propio cursor de tiempo que avanza según
+    sus IATs direccionales (Fwd IAT Mean/Std y Bwd IAT Mean/Std).
+  - t_inicio_bwd se calcula para que el último paquete Bwd caiga
+    exactamente en t0 + Flow_Duration del CSV.
+  - El handshake (SYN/SYN-ACK/ACK) solo se genera si SYN Flag Count > 0
+    en el CSV, respetando flujos capturados a mitad de sesión.
+
+Fidelidad a act_data_pkt_fwd:
+  - Los bytes del flujo se distribuyen solo entre los paquetes que
+    CICFlowMeter marca como portadores de payload (act_data_pkt_fwd).
+  - El resto de paquetes fwd se generan como ACKs puros (0 bytes),
+    produciendo los Duplicate ACKs que corresponden al tráfico real.
+  - Si act_data_pkt_fwd no está en el CSV, se usa fwd_pkts como fallback.
+
+Uso:
+    python generador_de_trafico.py                        # fila aleatoria
+    python generador_de_trafico.py --idx 5                # fila concreta
+    python generador_de_trafico.py --label DDoS           # tipo de ataque aleatorio
+    python generador_de_trafico.py --all --max 20         # hasta 20 flujos, uno por fila
+"""
+
+import argparse
 import os
 import time
-from scapy.all import IP, TCP, Raw, wrpcap
+import random
 
-# ==========================================
-# CONFIGURACIÓN
-# ==========================================
-ARCHIVO_CSV = 'ataques_adversarios_COMPLETOS.csv'
+import numpy as np
+import pandas as pd
 
-IP_ATACANTE     = "192.168.1.50"
-PUERTO_ATACANTE = 54321
-IP_VICTIMA      = "10.0.0.200"
-PUERTO_VICTIMA  = 80
+import scapy.config
+scapy.config.conf.ipv6_enabled = False
+from scapy.layers.inet import IP, TCP
+from scapy.packet import Raw
+from scapy.utils import wrpcap
 
-# ==========================================
-# CARGA DEL FLUJO
-# ==========================================
-def seleccionar_fila_aleatoria(archivo):
-    if not os.path.exists(archivo):
-        print(f"[-] Error: No se encontró '{archivo}'.")
-        return None, "Desconocido"
-    try:
-        df = pd.read_csv(archivo)
-        fila = df.sample(n=1)
-        nombre_ataque = fila['Label'].values[0] if 'Label' in fila.columns else "Desconocido"
-        nombre_ataque = nombre_ataque.encode('ascii', 'ignore').decode().strip()
-        fila_limpia = fila.drop(columns=['Label', '_ORIGIN_FILE_', '_ORIGIN_IDX_'], errors='ignore')
-        print(f"\n[✓] Fila seleccionada (Ataque: {nombre_ataque})")
-        print("-" * 50)
-        print(fila_limpia.iloc[0])
-        print("-" * 50)
-        return fila_limpia.iloc[0], nombre_ataque
-    except Exception as e:
-        print(f"[-] Error: {e}")
-        return None, "Desconocido"
+# ──────────────────────────────────────────────
+# CONFIGURACIÓN DE RED
+# ──────────────────────────────────────────────
+IP_ATACANTE    = "192.168.1.50"
+IP_VICTIMA     = "10.0.0.200"
+PUERTO_VICTIMA = 80
+MSS            = 1460  # Maximum Segment Size estándar TCP
 
-# ==========================================
-# FUNCIONES AUXILIARES
-# ==========================================
-def inferir_opciones_tcp(header_total, n_pkts):
-    if n_pkts <= 0: return []
-    header_medio = header_total / n_pkts
-    opciones = []
-    if header_medio >= 24: opciones.append(('NOP', None))
-    if header_medio >= 28: opciones.append(('MSS', 1460))
-    if header_medio >= 32: opciones.append(('WScale', 7))
-    opciones.append(('SAckOK', b''))  # siempre presente → elimina nota azul de Wireshark
-    if header_medio >= 44:
-        t = int(time.time()) & 0xFFFFFFFF
-        opciones.append(('Timestamp', (t, 0)))
-    return opciones
+ARCHIVO_CSV = "ataques_adversarios_COMPLETOS.csv"
 
-def generar_tamanios(n_pkts, total_bytes, mean, std):
-    if n_pkts <= 0: return []
-    if total_bytes <= 0: return [0] * n_pkts
-    if std <= 0 or n_pkts == 1:
-        base  = total_bytes // n_pkts
-        resto = total_bytes  % n_pkts
-        t = [base] * n_pkts
-        for i in range(resto): t[i] += 1
-        return t
-    t = np.random.normal(mean, std, n_pkts)
-    t = np.clip(t, 0, None)
-    s = t.sum()
-    if s > 0: t = t * (total_bytes / s)
-    t = np.round(t).astype(int)
-    t[-1] = max(0, t[-1] + (total_bytes - t.sum()))
-    return t.tolist()
+PUERTOS_POR_LABEL = {
+    "ftp-patator": 21,
+    "ssh-patator":  22,
+    "portscan":    443,
+    "bot":         443,
+}
 
-def generar_iats_direccionales(n, mean_us, std_us):
-    if n <= 0: return []
-    if std_us <= 0: return [max(mean_us / 1_000_000.0, 1e-6)] * n
-    iats = np.random.normal(mean_us, std_us, n)
-    iats = np.clip(iats, 1, None)
-    return (iats / 1_000_000.0).tolist()
+# ──────────────────────────────────────────────
+# COMPORTAMIENTO TCP POR LABEL (independiente del CSV)
+# Cada entrada define el patrón de apertura/cierre real del ataque.
+#
+#   syn  : True  → siempre generar SYN/SYN-ACK/ACK al inicio
+#   fin  : True  → cerrar con FIN/ACK (conexión completa)
+#   rst  : True  → cerrar con RST     (conexión abortada)
+#
+# Prioridad de cierre: rst > fin > sin cierre (conexión colgada)
+# ──────────────────────────────────────────────
+TCP_BEHAVIOR = {
+    # SYN + FIN: conexión TCP completa
+    "benign":                    {"syn": True,  "fin": True,  "rst": False},
+    "ftp-patator":               {"syn": True,  "fin": True,  "rst": False},
+    "ssh-patator":               {"syn": True,  "fin": True,  "rst": False},
+    "web attack brute force":    {"syn": True,  "fin": True,  "rst": False},
+    "web attack xss":            {"syn": True,  "fin": True,  "rst": False},
+    "web attack sql injection":  {"syn": True,  "fin": True,  "rst": False},
+    "heartbleed":                {"syn": True,  "fin": True,  "rst": False},
+    "infiltration":              {"syn": True,  "fin": True,  "rst": False},
+    "bot":                       {"syn": True,  "fin": True,  "rst": False},
+    # SYN + RST: conexión abortada
+    "dos hulk":                  {"syn": True,  "fin": False, "rst": True},
+    "dos goldeneye":             {"syn": True,  "fin": False, "rst": True},
+    "portscan":                  {"syn": True,  "fin": False, "rst": True},
+    # SYN solo: conexión intencionalmente incompleta (se queda colgada)
+    "ddos":                      {"syn": True,  "fin": False, "rst": False},
+    "dos slowloris":             {"syn": True,  "fin": False, "rst": False},
+    "dos slowhttptest":          {"syn": True,  "fin": False, "rst": False},
+}
 
-def construir_listas_flags_perfectas(fwd_pkts, bwd_pkts, syn, fin, rst, psh, ack):
+def tcp_behavior_para_label(label: str) -> dict:
     """
-    Construye flags TCP con handshake real dentro del límite de paquetes del CSV.
-    El handshake ocupa posiciones fijas: fwd[0]=SYN, bwd[0]=SYN-ACK, fwd[1]=ACK.
-    El cierre ocupa las últimas posiciones si hay FIN en el CSV.
-    El resto son datos con PSH/ACK según los contadores.
+    Devuelve el comportamiento TCP correcto para el label dado.
+    Busca por subcadena (case-insensitive) para tolerar variantes
+    del CSV como 'Web Attack  Brute Force' o 'DoS Hulk'.
+    Fallback: SYN + FIN (conexión completa) si el label no está mapeado.
     """
-    flags_fwd = ['A'] * fwd_pkts
-    flags_bwd = ['A'] * bwd_pkts
+    label_lower = label.lower().strip()
+    for key, behavior in TCP_BEHAVIOR.items():
+        if key in label_lower:
+            return behavior
+    # Label desconocido → conexión completa por defecto
+    return {"syn": True, "fin": True, "rst": False}
 
-    # ── 1. HANDSHAKE (solo si hay paquetes suficientes) ──────────────
-    handshake_fwd = 0
-    handshake_bwd = 0
-    if fwd_pkts >= 2 and bwd_pkts >= 1:
-        flags_fwd[0] = 'S'    # SYN
-        flags_bwd[0] = 'SA'   # SYN-ACK
-        flags_fwd[1] = 'A'    # ACK
-        handshake_fwd = 2
-        handshake_bwd = 1
-    elif fwd_pkts >= 1:
-        # Flujo muy corto — solo SYN sin respuesta
-        flags_fwd[0] = 'S'
-        handshake_fwd = 1
 
-    # ── 2. CIERRE (solo si el CSV indica FIN y hay paquetes) ─────────
-    fin_count = int(fin)
-    if fin_count > 0:
-        if fwd_pkts > handshake_fwd:
-            flags_fwd[-1] = 'FA'
-        if bwd_pkts > handshake_bwd:
-            flags_bwd[-1] = 'FA'
+# ──────────────────────────────────────────────
+# FILTRO DE APLICABILIDAD DEL CSV
+# ──────────────────────────────────────────────
+def filtrar_flujos_generables(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Descarta filas que producirían PCAPs incoherentes o inválidas.
 
-    # ── 3. PSH en paquetes de datos (entre handshake y cierre) ───────
-    # Zona de datos fwd: desde handshake_fwd hasta -1 (o fin si hay cierre)
-    fin_offset_fwd = 1 if (fin_count > 0 and fwd_pkts > handshake_fwd) else 0
-    zona_datos_fwd = list(range(handshake_fwd, fwd_pkts - fin_offset_fwd))
+    Criterios de descarte:
+      1. Init_Win_bytes_forward <= 0  → window TCP inválida en el SYN
+      2. Flow Packets/s >= 1e9        → artefacto de CICFlowMeter (div/0)
+      3. Flow Duration == 0 con >1 paquete → flujo instantáneo imposible
+      4. Flow IAT Min < 0             → timestamp negativo, bug del extractor
+      5. Payload Fwd == 0 sin SYN     → sin contenido ni handshake
+    """
+    n_antes = len(df)
 
-    restantes_psh = int(psh)
-    if zona_datos_fwd and restantes_psh > 0:
-        intervalo = max(len(zona_datos_fwd) // (restantes_psh + 1), 1)
-        for i, pos in enumerate(zona_datos_fwd):
-            if restantes_psh <= 0:
+    mask_ok = (
+        (df["Init_Win_bytes_forward"] > 0)
+        & (df["Flow Packets/s"] < 1e9)
+        & ~((df["Flow Duration"] == 0) & (df["Total Fwd Packets"] > 1))
+        & (df["Flow IAT Min"] >= 0)
+        & ~(
+            (df["Total Length of Fwd Packets"] == 0)
+            & (df["SYN Flag Count"] == 0)
+        )
+    )
+
+    df_ok = df[mask_ok].copy().reset_index(drop=True)
+    descartados = n_antes - len(df_ok)
+    if descartados:
+        print(f"[filtro] {n_antes} → {len(df_ok)} flujos "
+              f"({descartados} descartados, {descartados/n_antes*100:.1f}%)")
+    return df_ok
+
+
+# ──────────────────────────────────────────────
+# DISTRIBUCIONES DE IAT
+# ──────────────────────────────────────────────
+def _elegir_distribucion(mean_us: float, std_us: float, n: int) -> np.ndarray:
+    """
+    Selecciona la distribución según el coeficiente de variación (CV = std/mean).
+
+    CV < 0.3 → Weibull k>1   (tráfico periódico: keepalives, heartbeats)
+    CV ≈ 1   → Exponencial   (Poisson-like: DoS floods, port scans)
+    CV > 1   → Log-normal    (cola larga: HTTP idle, SSH interactivo)
+    """
+    if std_us <= 0 or n <= 1:
+        return np.full(n, mean_us)
+
+    cv = std_us / mean_us
+
+    if cv < 0.3:
+        import math
+        k   = max(1.0 / (cv ** 1.086), 1.5)
+        lam = mean_us / math.gamma(1.0 + 1.0 / k)
+        raw = np.random.weibull(k, n) * lam
+    elif cv < 1.3:
+        raw = np.random.exponential(scale=mean_us, size=n)
+    else:
+        sigma2 = np.log(1.0 + cv ** 2)
+        mu     = np.log(mean_us) - sigma2 / 2.0
+        raw    = np.random.lognormal(mean=mu, sigma=np.sqrt(sigma2), size=n)
+
+    return raw
+
+
+def generar_iats(n_pkts: int, mean_us: float, std_us: float,
+                 total_us: float) -> list:
+    """
+    Genera n_pkts-1 intervalos (segundos) con la distribución correcta,
+    escalados para que su suma == total_us µs exacto.
+    """
+    n_intervalos = max(n_pkts - 1, 0)
+    if n_intervalos == 0 or mean_us <= 0:
+        return []
+
+    raw  = _elegir_distribucion(mean_us, std_us, n_intervalos)
+    raw  = np.clip(raw, 1.0, None)
+    suma = raw.sum()
+    if suma > 0:
+        raw = raw * (total_us / suma)
+
+    return (raw / 1_000_000.0).tolist()
+
+
+# ──────────────────────────────────────────────
+# DISTRIBUCIÓN DE TAMAÑOS DE PAYLOAD
+# ──────────────────────────────────────────────
+def distribuir_bytes(n_pkts: int, total_bytes: int,
+                     mean: float, std: float) -> list:
+    """
+    Reparte total_bytes entre n_pkts paquetes siguiendo una distribución
+    normal truncada en 0. El último paquete absorbe el redondeo.
+    """
+    if n_pkts <= 0:
+        return []
+    if total_bytes <= 0:
+        return [0] * n_pkts
+    if n_pkts == 1:
+        return [total_bytes]
+
+    if std > 0:
+        raw = np.random.normal(mean, min(std, mean * 0.8), n_pkts)
+        raw = np.clip(raw, 0.0, None)
+        s   = raw.sum()
+        raw = raw * (total_bytes / s) if s > 0 else np.full(n_pkts, total_bytes / n_pkts)
+    else:
+        raw = np.full(n_pkts, total_bytes / n_pkts)
+
+    sizes = np.round(raw).astype(int)
+    sizes[-1] = max(0, sizes[-1] + (total_bytes - sizes.sum()))
+    return sizes.tolist()
+
+
+def fragmentar_si_necesario(sizes: list) -> list:
+    """
+    Fragmenta cualquier segmento que supere MSS en trozos de MSS,
+    manteniendo el total de bytes idéntico.
+    Esto evita paquetes IP imposibles en ataques con pocos act_data
+    pero muchos bytes (ej. DoS Hulk: 1 paquete de datos con 10 KB).
+    """
+    resultado = []
+    for sz in sizes:
+        while sz > MSS:
+            resultado.append(MSS)
+            sz -= MSS
+        resultado.append(sz)
+    return resultado
+
+
+# ──────────────────────────────────────────────
+# OPCIONES TCP REALISTAS
+# ──────────────────────────────────────────────
+def opciones_syn(mss: int = 1460, wscale: int = 7, ts_val: int = None) -> list:
+    if ts_val is None:
+        ts_val = int(time.time() * 1000) & 0xFFFFFFFF
+    return [
+        ("MSS",       mss),
+        ("SAckOK",    b""),
+        ("Timestamp", (ts_val, 0)),
+        ("NOP",       None),
+        ("WScale",    wscale),
+    ]
+
+
+def opciones_synack(mss: int = 1460, wscale: int = 7,
+                    ts_val: int = None, ts_echo: int = 0) -> list:
+    if ts_val is None:
+        ts_val = int(time.time() * 1000) & 0xFFFFFFFF
+    return [
+        ("MSS",       mss),
+        ("SAckOK",    b""),
+        ("Timestamp", (ts_val, ts_echo)),
+        ("NOP",       None),
+        ("WScale",    wscale),
+    ]
+
+
+def opciones_datos(ts_val: int, ts_echo: int) -> list:
+    return [
+        ("NOP",       None),
+        ("NOP",       None),
+        ("Timestamp", (ts_val & 0xFFFFFFFF, ts_echo & 0xFFFFFFFF)),
+    ]
+
+
+# ──────────────────────────────────────────────
+# ASIGNACIÓN DE FLAGS TCP
+# ──────────────────────────────────────────────
+def asignar_flags(fwd_pkts: int, bwd_pkts: int,
+                  fin_cnt: int, rst_cnt: int, psh_cnt: int,
+                  syn_cnt: int = 0):
+    """
+    Construye las listas de flags por paquete para Fwd y Bwd.
+
+    El comportamiento depende de la combinación syn/fin/rst forzada por label:
+
+    SYN + FIN (conexión completa):
+        SYN → SYN-ACK → ACK ... datos ... FIN-ACK → FIN-ACK
+    SYN + RST (conexión abortada):
+        SYN → SYN-ACK → ACK ... datos ... RST
+        (sin FIN en ninguna dirección)
+    SYN solo (conexión intencionalmente incompleta):
+        SYN → SYN-ACK → ACK ... datos ...
+        (sin cierre: slowloris, DDoS SYN flood)
+    Sin SYN (mid-session):
+        Solo ACKs y datos, sin handshake ni cierre explícito.
+
+    PSH se distribuye uniformemente en la zona de datos Fwd.
+    """
+    flags_fwd = ["A"] * fwd_pkts
+    flags_bwd = ["A"] * bwd_pkts
+
+    hw_fwd, hw_bwd = 0, 0   # offset tras handshake
+    cierre_fwd = 0           # offset al cierre al final
+
+    if syn_cnt > 0:
+        # ── Handshake: SYN → SYN-ACK → ACK ──────────────────────────────
+        if fwd_pkts >= 2 and bwd_pkts >= 1:
+            flags_fwd[0] = "S"
+            flags_bwd[0] = "SA"
+            flags_fwd[1] = "A"
+            hw_fwd, hw_bwd = 2, 1
+        elif fwd_pkts >= 1:
+            flags_fwd[0] = "S"
+            hw_fwd = 1
+
+        # ── Cierre según comportamiento del ataque ────────────────────────
+        if rst_cnt > 0 and fin_cnt == 0:
+            # SYN + RST: solo RST al final del lado fwd, sin FIN
+            if fwd_pkts > hw_fwd:
+                flags_fwd[-1] = "R"
+                cierre_fwd = 1
+            # bwd no cierra con nada (RST aborta sin negociación)
+
+        elif fin_cnt > 0:
+            # SYN + FIN: cierre limpio en ambas direcciones
+            if fwd_pkts > hw_fwd:
+                flags_fwd[-1] = "FA"
+                cierre_fwd = 1
+            if bwd_pkts > hw_bwd:
+                flags_bwd[-1] = "FA"
+
+        # else: SYN solo → sin cierre (slowloris, DDoS); cierre_fwd = 0
+
+    # ── PSH distribuido en zona de datos Fwd ─────────────────────────────
+    # Excluye handshake y el paquete de cierre (FIN/RST)
+    zona      = list(range(hw_fwd, fwd_pkts - cierre_fwd))
+    restantes = int(psh_cnt)
+    if zona and restantes > 0:
+        paso = max(len(zona) // (restantes + 1), 1)
+        for i, pos in enumerate(zona):
+            if restantes <= 0:
                 break
-            if i % intervalo == 0:
-                flags_fwd[pos] = 'PA'
-                restantes_psh -= 1
-
-    # ── 4. RST al final si el CSV lo indica ──────────────────────────
-    if int(rst) > 0 and fwd_pkts > handshake_fwd:
-        flags_fwd[-1] = 'R'
+            if i % paso == 0:
+                flags_fwd[pos] = "PA"
+                restantes -= 1
 
     return flags_fwd, flags_bwd
 
-# ==========================================
-# CONSTRUCCIÓN DEL PCAP
-# ==========================================
-def generar_pcap_desde_flujo(flujo, nombre_ataque):
-    if flujo is None: return
 
-    # ── Extraer métricas ─────────────────────────────────────────────
-    fwd_pkts  = int(max(flujo.get('Total Fwd Packets', 1), 1))
-    bwd_pkts  = int(max(flujo.get('Total Backward Packets', 0), 0))
-    fwd_bytes = int(max(flujo.get('Total Length of Fwd Packets', 0), 0))
-    bwd_bytes = int(max(flujo.get('Total Length of Bwd Packets', 0), 0))
-    ventana_fwd = int(max(flujo.get('Init_Win_bytes_forward',  8192), 1))
-    ventana_bwd = int(max(flujo.get('Init_Win_bytes_backward', 8192), 1))
+# ──────────────────────────────────────────────
+# CONSTRUCCIÓN DEL FLUJO DE PAQUETES
+# ──────────────────────────────────────────────
+def construir_paquetes(flujo: pd.Series, t0: float) -> list:
+    label = str(flujo.get("Label", "unknown")).lower()
 
-    fwd_mean = float(flujo.get('Fwd Packet Length Mean', fwd_bytes / fwd_pkts if fwd_pkts else 0))
-    fwd_std  = float(flujo.get('Fwd Packet Length Std',  0))
-    bwd_mean = float(flujo.get('Bwd Packet Length Mean', bwd_bytes / bwd_pkts if bwd_pkts else 0))
-    bwd_std  = float(flujo.get('Bwd Packet Length Std',  0))
+    sport = random.randint(49152, 65535)
+    dport = PUERTO_VICTIMA
+    for k, v in PUERTOS_POR_LABEL.items():
+        if k in label:
+            dport = v
+            break
 
-    # Usamos Flow IAT Mean para ambas direcciones — es la única forma de que
-    # la suma total de tiempos coincida con Flow Duration del CSV.
-    # Fwd IAT Mean y Bwd IAT Mean son muy distintos entre sí y no reproducen
-    # el Flow Duration correctamente (error medio de 54 millones de µs).
-    fwd_iat_mean = float(flujo.get('Flow IAT Mean', 1000))
-    fwd_iat_std  = float(flujo.get('Flow IAT Std',  0))
-    bwd_iat_mean = float(flujo.get('Flow IAT Mean', 1000))
-    bwd_iat_std  = float(flujo.get('Flow IAT Std',  0))
+    fwd_pkts  = int(max(flujo.get("Total Fwd Packets",      1), 1))
+    bwd_pkts  = int(max(flujo.get("Total Backward Packets", 0), 0))
+    fwd_bytes = int(max(flujo.get("Total Length of Fwd Packets", 0), 0))
+    bwd_bytes = int(max(flujo.get("Total Length of Bwd Packets", 0), 0))
 
-    # Flow Duration en segundos (el CSV lo da en microsegundos)
-    flow_duration_us = float(flujo.get('Flow Duration', 0))
-    flow_duration_s  = flow_duration_us / 1_000_000.0
+    fwd_mean = float(flujo.get("Fwd Packet Length Mean",
+                                fwd_bytes / fwd_pkts if fwd_pkts else 0))
+    fwd_std  = float(flujo.get("Fwd Packet Length Std", 0))
+    bwd_mean = float(flujo.get("Bwd Packet Length Mean",
+                                bwd_bytes / bwd_pkts if bwd_pkts else 0))
+    bwd_std  = float(flujo.get("Bwd Packet Length Std", 0))
 
-    fwd_header_total = float(flujo.get('Fwd Header Length', 20 * fwd_pkts))
-    bwd_header_total = float(flujo.get('Bwd Header Length', 20 * bwd_pkts))
-    opciones_fwd = inferir_opciones_tcp(fwd_header_total, fwd_pkts)
-    opciones_bwd = inferir_opciones_tcp(bwd_header_total, bwd_pkts)
+    win_fwd = int(np.clip(flujo.get("Init_Win_bytes_forward",  8192), 1, 65535))
+    win_bwd = int(np.clip(flujo.get("Init_Win_bytes_backward", 8192), 1, 65535))
 
-    syn = flujo.get('SYN Flag Count', 0)
-    fin = flujo.get('FIN Flag Count', 0)
-    rst = flujo.get('RST Flag Count', 0)
-    psh = flujo.get('PSH Flag Count', 0)
-    ack = flujo.get('ACK Flag Count', 0)
+    fwd_iat_total = float(flujo.get("Fwd IAT Total", 0))
+    fwd_iat_mean  = float(flujo.get("Fwd IAT Mean",  0))
+    fwd_iat_std   = float(flujo.get("Fwd IAT Std",   0))
+    bwd_iat_total = float(flujo.get("Bwd IAT Total", 0))
+    bwd_iat_mean  = float(flujo.get("Bwd IAT Mean",  0))
+    bwd_iat_std   = float(flujo.get("Bwd IAT Std",   0))
 
-    # Tamaños: los paquetes de handshake no llevan payload,
-    # así que distribuimos los bytes solo entre los paquetes de datos
-    tamanios_fwd = generar_tamanios(fwd_pkts, fwd_bytes, fwd_mean, fwd_std)
-    tamanios_bwd = generar_tamanios(bwd_pkts, bwd_bytes, bwd_mean, bwd_std)
-    iats_fwd     = generar_iats_direccionales(fwd_pkts, fwd_iat_mean, fwd_iat_std)
-    iats_bwd     = generar_iats_direccionales(bwd_pkts, bwd_iat_mean, bwd_iat_std)
+    psh     = int(flujo.get("PSH Flag Count", 0))
 
-    # ── Normalizar IATs para que Flow Duration coincida exactamente ──
-    # CICFlowMeter mide la duración desde el primer al último paquete,
-    # que equivale a la suma de todos los IATs del flujo combinado.
-    total_pkts_datos = fwd_pkts + bwd_pkts
-    if flow_duration_s > 0 and total_pkts_datos > 1:
-        suma_iats = sum(iats_fwd) + sum(iats_bwd)
-        if suma_iats > 0:
-            factor = flow_duration_s / suma_iats
-            iats_fwd = [x * factor for x in iats_fwd]
-            iats_bwd = [x * factor for x in iats_bwd]
+    # ── Comportamiento TCP forzado por label (ignora valores del CSV) ─────
+    # Los flags SYN/FIN/RST se determinan por el tipo de ataque real,
+    # no por lo que reportó CICFlowMeter en el CSV original.
+    behavior = tcp_behavior_para_label(label)
+    syn_cnt  = 1 if behavior["syn"] else 0
+    fin      = 1 if behavior["fin"] else 0
+    rst      = 1 if behavior["rst"] else 0
 
-    # ── Construir flags con handshake dentro del conteo ──────────────
-    flags_fwd, flags_bwd = construir_listas_flags_perfectas(
-        fwd_pkts, bwd_pkts, syn, fin, rst, psh, ack)
+    # ── Distribución de payload fiel a act_data_pkt_fwd ──────────────────
+    #
+    # act_data_pkt_fwd (feature de CICFlowMeter) indica cuántos paquetes
+    # fwd transportaron payload real. El resto son ACKs puros (0 bytes).
+    # Respetar este valor hace que los Duplicate ACKs del PCAP coincidan
+    # con los que habría en una captura real del mismo tráfico.
+    #
+    # Fallback: si la columna no existe en el CSV, se usan todos los pkts.
+    act_data = int(flujo.get("act_data_pkt_fwd", fwd_pkts))
+    act_data = max(1, min(act_data, fwd_pkts))  # sanidad: [1, fwd_pkts]
 
-    print(f"\n[*] Reconstruyendo flujo '{nombre_ataque}' (handshake incluido)...")
-    print(f"    FWD: {fwd_pkts} pkts | {fwd_bytes} bytes | win={ventana_fwd}")
-    print(f"    BWD: {bwd_pkts} pkts | {bwd_bytes} bytes | win={ventana_bwd}")
-    print(f"    Flow Duration CSV: {flow_duration_us:.0f} µs ({flow_duration_s:.6f} s)")
-    print(f"    IAT FWD Total: {sum(iats_fwd)*1e6:.0f} µs | IAT BWD Total: {sum(iats_bwd)*1e6:.0f} µs")
-    print(f"    Flags FWD: {flags_fwd}")
-    print(f"    Flags BWD: {flags_bwd}")
+    if act_data < fwd_pkts:
+        # Distribuir bytes solo entre act_data paquetes y fragmentar si >MSS
+        sizes_data = distribuir_bytes(act_data, fwd_bytes, fwd_mean, fwd_std)
+        sizes_data = fragmentar_si_necesario(sizes_data)
 
-    # ── MOTOR TCP PING-PONG ──────────────────────────────────────────
+        # Si la fragmentación añadió paquetes extra, ajustar fwd_pkts
+        pkts_datos_real = len(sizes_data)
+        pkts_ack_puros  = fwd_pkts - act_data  # ACKs sin payload
+
+        if pkts_datos_real + pkts_ack_puros != fwd_pkts:
+            # La fragmentación generó más paquetes de los previstos;
+            # recalcular el total para mantener coherencia
+            fwd_pkts = pkts_datos_real + pkts_ack_puros
+
+        sizes_fwd = sizes_data + [0] * pkts_ack_puros
+        # Mezclar: los ACKs no van todos al final, sino intercalados
+        random.shuffle(sizes_fwd)
+    else:
+        # Todos los paquetes llevan datos (act_data == fwd_pkts)
+        sizes_fwd = distribuir_bytes(fwd_pkts, fwd_bytes, fwd_mean, fwd_std)
+        sizes_fwd = fragmentar_si_necesario(sizes_fwd)
+        if len(sizes_fwd) != fwd_pkts:
+            fwd_pkts = len(sizes_fwd)
+
+    sizes_bwd = distribuir_bytes(bwd_pkts, bwd_bytes, bwd_mean, bwd_std)
+    sizes_bwd = fragmentar_si_necesario(sizes_bwd)
+    if len(sizes_bwd) != bwd_pkts:
+        bwd_pkts = len(sizes_bwd)
+
+    # ── IATs ──────────────────────────────────────────────────────────────
+    iats_fwd = generar_iats(fwd_pkts, fwd_iat_mean, fwd_iat_std, fwd_iat_total)
+    iats_bwd = generar_iats(bwd_pkts, bwd_iat_mean, bwd_iat_std, bwd_iat_total)
+
+    # ── Flags TCP ─────────────────────────────────────────────────────────
+    flags_fwd, flags_bwd = asignar_flags(
+        fwd_pkts, bwd_pkts, fin, rst, psh, syn_cnt=syn_cnt
+    )
+
+    # ── Timestamps ────────────────────────────────────────────────────────
+    # t_inicio_bwd se ancla algebraicamente para que el último paquete
+    # Bwd caiga exactamente en t0 + Flow_Duration del CSV.
+    #
+    #   ts_bwd[-1] = t0 + t_inicio_bwd + bwd_iat_total = t0 + flow_duration_s
+    #   → t_inicio_bwd = flow_duration_s - bwd_iat_total
+    #
+    # Fallback para flujos unidireccionales (bwd_pkts == 0 o bwd_total == 0).
+    flow_duration_s = float(flujo.get("Flow Duration", 0)) / 1_000_000.0
+    bwd_total_s     = bwd_iat_total / 1_000_000.0
+
+    if bwd_pkts > 0 and bwd_total_s > 0:
+        t_inicio_bwd = max(flow_duration_s - bwd_total_s, 0.0)
+    else:
+        t_inicio_bwd = (iats_fwd[0] / 2.0) if iats_fwd else 0.0005
+
+    ts_cursor_fwd = [t0]
+    for iat in iats_fwd:
+        ts_cursor_fwd.append(ts_cursor_fwd[-1] + iat)
+
+    ts_cursor_bwd = [t0 + t_inicio_bwd]
+    for iat in iats_bwd:
+        ts_cursor_bwd.append(ts_cursor_bwd[-1] + iat)
+
+    # ── Opciones TCP ──────────────────────────────────────────────────────
+    ts_base       = int(t0 * 1000) & 0xFFFFFFFF
+    ts_syn_opt    = ts_base
+    ts_synack_opt = (ts_base + 1) & 0xFFFFFFFF
+
+    opts_syn    = opciones_syn(ts_val=ts_syn_opt)
+    opts_synack = opciones_synack(ts_val=ts_synack_opt, ts_echo=ts_syn_opt)
+
+    # ── Números de secuencia ──────────────────────────────────────────────
+    isn_fwd = random.randint(100_000, 999_999_999)
+    isn_bwd = random.randint(100_000, 999_999_999)
+    seq_fwd = isn_fwd
+    seq_bwd = isn_bwd
+
+    # ── Merge ping-pong por timestamp ─────────────────────────────────────
+    eventos = []
+    for i, ts in enumerate(ts_cursor_fwd[:fwd_pkts]):
+        eventos.append((ts, "fwd", i))
+    for i, ts in enumerate(ts_cursor_bwd[:bwd_pkts]):
+        eventos.append((ts, "bwd", i))
+    eventos.sort(key=lambda e: e[0])
+
     paquetes = []
-    seq_fwd = 1000
-    seq_bwd = 5000
-    t = time.time()
-    idx_fwd = 0
-    idx_bwd = 0
 
-    bytes_pendientes_fwd = 0  # Bytes que no pudieron ir en SYN/FIN → se pasan al siguiente
-    bytes_pendientes_bwd = 0
+    for ts, direccion, idx in eventos:
+        ts_opt_val = (int(ts * 1000)) & 0xFFFFFFFF
 
-    for _ in range(fwd_pkts + bwd_pkts):
-        if idx_fwd < fwd_pkts and (idx_fwd <= idx_bwd or idx_bwd >= bwd_pkts):
-            flag    = flags_fwd[idx_fwd]
-            es_handshake = ('S' in flag and 'A' not in flag)
+        if direccion == "fwd":
+            flag       = flags_fwd[idx]
+            es_syn     = (flag == "S")
+            payload_sz = sizes_fwd[idx] if not es_syn else 0
+            opts       = opts_syn if es_syn else opciones_datos(ts_opt_val, ts_synack_opt)
 
-            bytes_asignados = tamanios_fwd[idx_fwd]
-            if es_handshake or 'F' in flag:
-                bytes_pendientes_fwd += bytes_asignados  # guardamos para el siguiente
-                payload = 0
-            else:
-                payload = bytes_asignados + bytes_pendientes_fwd
-                bytes_pendientes_fwd = 0
+            pkt = (IP(src=IP_ATACANTE, dst=IP_VICTIMA) /
+                   TCP(sport=sport, dport=dport,
+                       flags=flag,
+                       seq=seq_fwd,
+                       ack=(0 if es_syn else seq_bwd),
+                       window=win_fwd,
+                       options=opts))
+            if payload_sz > 0:
+                pkt = pkt / Raw(load=b"\x00" * payload_sz)
 
-            datos   = Raw(load=b"X" * payload) if payload > 0 else b""
-            opts    = opciones_fwd if es_handshake else []
-            ack_val = 0 if es_handshake else seq_bwd
+            pkt.time = ts
+            paquetes.append(pkt)
 
-            p = IP(src=IP_ATACANTE, dst=IP_VICTIMA) / \
-                TCP(sport=PUERTO_ATACANTE, dport=PUERTO_VICTIMA,
-                    flags=flag, seq=seq_fwd, ack=ack_val,
-                    window=ventana_fwd, options=opts)
-            if datos: p = p / datos
-            p.time = t; paquetes.append(p)
+            inc     = payload_sz + (1 if ("S" in flag or "F" in flag) else 0)
+            seq_fwd = (seq_fwd + inc) & 0xFFFFFFFF
 
-            inc = payload + (1 if ('S' in flag or 'F' in flag) else 0)
-            seq_fwd += inc  # sin max(inc,1) — TCP real no avanza seq en ACK puro
-            t += iats_fwd[idx_fwd] if idx_fwd < len(iats_fwd) else 0.001
-            idx_fwd += 1
+        else:
+            flag      = flags_bwd[idx]
+            es_synack = ("S" in flag and "A" in flag)
+            payload_sz = sizes_bwd[idx] if not es_synack else 0
+            opts       = opts_synack if es_synack else opciones_datos(ts_opt_val, ts_syn_opt)
 
-        elif idx_bwd < bwd_pkts:
-            flag    = flags_bwd[idx_bwd]
-            es_synack = ('S' in flag and 'A' in flag)
+            pkt = (IP(src=IP_VICTIMA, dst=IP_ATACANTE) /
+                   TCP(sport=dport, dport=sport,
+                       flags=flag,
+                       seq=seq_bwd,
+                       ack=seq_fwd,
+                       window=win_bwd,
+                       options=opts))
+            if payload_sz > 0:
+                pkt = pkt / Raw(load=b"\x00" * payload_sz)
 
-            bytes_asignados = tamanios_bwd[idx_bwd]
-            if es_synack or 'F' in flag:
-                bytes_pendientes_bwd += bytes_asignados
-                payload = 0
-            else:
-                payload = bytes_asignados + bytes_pendientes_bwd
-                bytes_pendientes_bwd = 0
+            pkt.time = ts
+            paquetes.append(pkt)
 
-            datos   = Raw(load=b"V" * payload) if payload > 0 else b""
-            opts    = opciones_bwd if es_synack else []
+            inc     = payload_sz + (1 if ("S" in flag or "F" in flag) else 0)
+            seq_bwd = (seq_bwd + inc) & 0xFFFFFFFF
 
-            p = IP(src=IP_VICTIMA, dst=IP_ATACANTE) / \
-                TCP(sport=PUERTO_VICTIMA, dport=PUERTO_ATACANTE,
-                    flags=flag, seq=seq_bwd, ack=seq_fwd,
-                    window=ventana_bwd, options=opts)
-            if datos: p = p / datos
-            p.time = t; paquetes.append(p)
+    return paquetes
 
-            inc = payload + (1 if ('S' in flag or 'F' in flag) else 0)
-            seq_bwd += inc  # sin max(inc,1)
-            t += iats_bwd[idx_bwd] if idx_bwd < len(iats_bwd) else 0.001
-            idx_bwd += 1
 
-    # ── GUARDAR ──────────────────────────────────────────────────────
-    nombre_seguro  = nombre_ataque.replace(" ", "_").replace("/", "_")
-    nombre_archivo = f"Ataque_Sintetizado_{nombre_seguro}_CON_HANDSHAKE.pcap"
-    wrpcap(nombre_archivo, paquetes)
-    print(f"\n[🏆] Guardado: '{nombre_archivo}'")
-    print(f"     -> Total paquetes exactos: {len(paquetes)} (igual que el CSV)")
+# ──────────────────────────────────────────────
+# CARGA Y SELECCIÓN DE FILAS
+# ──────────────────────────────────────────────
+def cargar_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No encontrado: {path}")
+    df = pd.read_csv(path)
+    if "Label" in df.columns:
+        df["Label"] = (df["Label"].astype(str)
+                       .str.encode("ascii", "ignore")
+                       .str.decode("ascii")
+                       .str.strip())
+    df = filtrar_flujos_generables(df)
+    return df
+
+
+def seleccionar_fila(df: pd.DataFrame, idx: int = None,
+                     label: str = None) -> pd.Series:
+    if idx is not None:
+        return df.iloc[idx]
+    if label:
+        sub = df[df["Label"].str.lower() == label.lower()]
+        if sub.empty:
+            raise ValueError(f"No hay filas con label='{label}'")
+        return sub.sample(1).iloc[0]
+    return df.sample(1).iloc[0]
+
+
+# ──────────────────────────────────────────────
+# INFORME POR CONSOLA
+# ──────────────────────────────────────────────
+def imprimir_resumen(flujo: pd.Series, n_pkts: int,
+                     nombre_archivo: str) -> None:
+    fwd      = int(flujo.get("Total Fwd Packets",      0))
+    bwd      = int(flujo.get("Total Backward Packets", 0))
+    dur      = float(flujo.get("Flow Duration",        0))
+    act_data = int(flujo.get("act_data_pkt_fwd",       fwd))
+    label    = str(flujo.get("Label", "unknown"))
+
+    behavior = tcp_behavior_para_label(label)
+    if behavior["fin"]:
+        tcp_modo = "SYN + FIN  (conexión completa)"
+    elif behavior["rst"]:
+        tcp_modo = "SYN + RST  (conexión abortada)"
+    elif behavior["syn"]:
+        tcp_modo = "SYN solo   (conexión incompleta)"
+    else:
+        tcp_modo = "Mid-session (sin handshake)"
+
+    print("\n" + "=" * 55)
+    print(f"  Ataque      : {label}")
+    print(f"  Origen      : {flujo.get('_ORIGIN_FILE_', '?')}")
+    print(f"  TCP modo    : {tcp_modo}")
+    print(f"  Fwd pkts    : {fwd}  (con datos: {act_data}, ACK puros: {fwd - act_data})")
+    print(f"  Bwd pkts    : {bwd}")
+    print(f"  Fwd bytes   : {int(flujo.get('Total Length of Fwd Packets', 0))}"
+          f"   |   Bwd bytes: {int(flujo.get('Total Length of Bwd Packets', 0))}")
+    print(f"  Flow Dur    : {dur/1e6:.6f} s  ({dur:.0f} µs)")
+    print(f"  Flow IAT Mean CSV : {float(flujo.get('Flow IAT Mean', 0)):.1f} µs")
+    print(f"  Fwd IAT Mean CSV  : {float(flujo.get('Fwd IAT Mean',  0)):.1f} µs")
+    print(f"  Bwd IAT Mean CSV  : {float(flujo.get('Bwd IAT Mean',  0)):.1f} µs")
+    print(f"  Win fwd     : {int(flujo.get('Init_Win_bytes_forward',  0))}"
+          f"   |   Win bwd: {int(flujo.get('Init_Win_bytes_backward', 0))}")
+    print(f"  Paquetes generados: {n_pkts}")
+    print(f"  Guardado en : {nombre_archivo}")
+    print("=" * 55 + "\n")
+
+
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
+def procesar_flujo(flujo: pd.Series, t0: float,
+                   directorio: str = ".") -> str:
+    label_safe = (str(flujo.get("Label", "unknown"))
+                  .replace(" ", "_").replace("/", "_")
+                  .encode("ascii", "ignore").decode())
+    nombre = f"flujo_{label_safe}_{int(t0)}.pcap"
+    ruta   = os.path.join(directorio, nombre)
+
+    pkts = construir_paquetes(flujo, t0)
+    wrpcap(ruta, pkts)
+    imprimir_resumen(flujo, len(pkts), ruta)
+    return ruta
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Genera PCAP realista desde el CSV adversario.")
+    parser.add_argument("--csv",   default=ARCHIVO_CSV)
+    parser.add_argument("--idx",   type=int,  default=None,
+                        help="Índice de fila concreto")
+    parser.add_argument("--label", type=str,  default=None,
+                        help="Tipo de ataque (ej: DDoS, PortScan)")
+    parser.add_argument("--all",   action="store_true",
+                        help="Generar un PCAP por cada fila del CSV")
+    parser.add_argument("--max",   type=int,  default=10,
+                        help="Máximo de flujos con --all (default: 10)")
+    parser.add_argument("--out",   default=".",
+                        help="Directorio de salida (default: .)")
+    args = parser.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+    df = cargar_csv(args.csv)
+    t0 = time.time()
+
+    if args.all:
+        filas = df.head(args.max)
+        print(f"[*] Generando {len(filas)} flujos...")
+        for i, (_, fila) in enumerate(filas.iterrows()):
+            procesar_flujo(fila, t0 + i * 200.0, args.out)
+    else:
+        fila = seleccionar_fila(df, idx=args.idx, label=args.label)
+        procesar_flujo(fila, t0, args.out)
 
 
 if __name__ == "__main__":
-    fila, nombre = seleccionar_fila_aleatoria(ARCHIVO_CSV)
-    generar_pcap_desde_flujo(fila, nombre)
+    main()
