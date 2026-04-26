@@ -10,6 +10,7 @@ import numpy as np
 CARPETA_FLOWS = 'flows'
 MODELO_VICTIMA_PATH = 'random_forest_cic17_best.pkl'
 ENCODER_PATH = 'label_encoder.pkl'
+SCALER_PATH = 'scaler.pkl'  # <-- IMPORTANTE: Cargar el escalador original
 ARCHIVO_REPORTE_FINAL = 'REPORTE_GLOBAL_PREDICCIONES.csv'
 
 columnas_basura = [
@@ -36,11 +37,16 @@ def load_models():
         raise FileNotFoundError(f"[-] No se encuentra el modelo: {MODELO_VICTIMA_PATH}")
     if not os.path.exists(ENCODER_PATH):
         raise FileNotFoundError(f"[-] No se encuentra el encoder: {ENCODER_PATH}")
+    if not os.path.exists(SCALER_PATH):
+        print("[!] Advertencia: No se encontró scaler.pkl. Las predicciones podrían fallar.")
+        scaler = None
+    else:
+        scaler = joblib.load(SCALER_PATH)
     
-    print("[*] Cargando Random Forest y Label Encoder...")
+    print("[*] Cargando Random Forest, Label Encoder y Scaler...")
     model = joblib.load(MODELO_VICTIMA_PATH)
     le = joblib.load(ENCODER_PATH)
-    return model, le
+    return model, le, scaler
 
 def preprocess_csv(df):
     df_clean = df.copy()
@@ -70,7 +76,7 @@ def align_features(X, model):
 
 def main():
     try:
-        model, le = load_models()
+        model, le, scaler = load_models()
     except Exception as e:
         print(e)
         return
@@ -98,36 +104,48 @@ def main():
                 continue
                 
             df_original.columns = df_original.columns.str.strip()
+
+            # --- CAMBIO 1: FILTRAR CABECERAS REPETIDAS ---
+            # Si CICFlowMeter concatenó archivos, eliminamos las filas con nombres de columnas
+            if 'Flow ID' in df_original.columns:
+                df_original = df_original[df_original['Flow ID'] != 'Flow ID'].copy()
+
+            if df_original.empty:
+                continue
             
             X_clean = preprocess_csv(df_original)
             X_aligned = align_features(X_clean, model)
             
-            # Hacer la predicción (devuelve un array, ej: o)
-            y_pred_enc = model.predict(X_aligned)
+            # --- CAMBIO 2: ESCALAR ANTES DE PREDECIR ---
+            if scaler:
+                X_final = scaler.transform(X_aligned)
+            else:
+                X_final = X_aligned
+
+            y_pred_enc = model.predict(X_final)
             
             try:
                 y_pred_labels = le.inverse_transform(y_pred_enc)
             except:
                 y_pred_labels = y_pred_enc
                 
-            # Copiar el DataFrame original para añadirle los datos
             df_resultado = df_original.copy()
             
-            # --- LA SOLUCIÓN ESTÁ AQUÍ ---
-            # Asignamos la lista entera de predicciones directamente a una nueva columna
-            # Si el CSV tiene 1 fila, y_pred_labels tiene 1 elemento. Si tiene 2, tiene 2.
+            # --- ASIGNACIÓN DE VERDICTO ---
             df_resultado['Veredicto_IA'] = y_pred_labels
             df_resultado.insert(0, 'Archivo_Origen', nombre_base)
             
-            # Comprobamos la primera fila solo para el print visual en consola
-            prediccion_final = y_pred_labels
+            # Conteo de evasiones (si hay múltiples filas por archivo, contamos la tasa)
+            flujos_en_archivo = len(y_pred_labels)
+            evasiones_en_archivo = np.sum(["BENIGN" in str(lb).upper() for lb in y_pred_labels])
             
-            total_analizados += 1
-            if "BENIGN" in str(prediccion_final).upper():
-                print(f"[🏆] {nombre_base}: EVASIÓN EXITOSA (Clasificado como BENIGN)")
-                evasiones_exitosas += 1
+            total_analizados += flujos_en_archivo
+            evasiones_exitosas += evasiones_en_archivo
+
+            if evasiones_en_archivo == flujos_en_archivo:
+                print(f"[🏆] {nombre_base}: EVASIÓN TOTAL ({evasiones_en_archivo}/{flujos_en_archivo})")
             else:
-                print(f"[❌] {nombre_base}: DETECTADO (Clasificado como {prediccion_final})")
+                print(f"[❌] {nombre_base}: DETECTADO ({flujos_en_archivo - evasiones_en_archivo} flujos detectados)")
                 
             lista_resultados.append(df_resultado)
             
@@ -142,7 +160,7 @@ def main():
         df_final_global.to_csv(ARCHIVO_REPORTE_FINAL, index=False)
         
         print(f"[✓] Reporte guardado exitosamente en: {ARCHIVO_REPORTE_FINAL}")
-        print(f"[i] TASA DE EVASIÓN FINAL EN LA RED: {(evasiones_exitosas/total_analizados)*100:.2f}% ({evasiones_exitosas}/{total_analizados})")
+        print(f"[i] TASA DE EVASIÓN GLOBAL: {(evasiones_exitosas/total_analizados)*100:.2f}% ({evasiones_exitosas}/{total_analizados} flujos)")
     else:
         print("\n[-] No se pudo procesar ningún archivo con éxito.")
 

@@ -33,21 +33,21 @@ CANTIDAD_ATAQUES   = 1000
 EPOCHS             = 300
 BATCH_SIZE         = 64
 LEARNING_RATE      = 0.0001
-FACTOR_PENALIZACION = 25.0
+FACTOR_PENALIZACION = 1
 
 # Límites físicos (Deltas máximos permitidos por la GAN)
 LIMITES_FISICOS = {
     'Init_Win_bytes_forward':   65535.0,
     'Init_Win_bytes_backward':      0.0,
     'Bwd Packet Length Min':        2.0,
-    'Fwd Header Length':          400.0,
+    'Fwd Header Length':          40.0,
     'Bwd Packet Length Std':       10.0,
     'Bwd Packet Length Mean':       5.0,
     'Avg Bwd Segment Size':         5.0,
     'Bwd Packet Length Max':       10.0,
-    'Packet Length Mean':         800.0,
+    'Packet Length Mean':         100.0,
     'Max Packet Length':           10.0,
-    'Total Length of Bwd Packets': 50.0,
+    'Total Length of Bwd Packets': 8.0,
     'Flow IAT Mean':             100.0,
 }
 
@@ -422,40 +422,27 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
         header_aligned           = np.round(df_base['Fwd Header Length'] / 4.0) * 4.0
         df_base['Fwd Header Length'] = header_aligned.astype(int)
         if 'Total Fwd Packets' in df_base.columns:
-            estimated_packets        = np.ceil(df_base['Fwd Header Length'] / 32.0).astype(int)
-            df_base['Total Fwd Packets'] = np.maximum(df_base['Total Fwd Packets'], estimated_packets)
+            #Si aumentamos fw packet length desnombrar esto
+            #estimated_packets        = np.ceil(df_base['Fwd Header Length'] / 32.0).astype(int)
+            #df_base['Total Fwd Packets'] = np.maximum(df_base['Total Fwd Packets'], estimated_packets)
             print("    -> Recalculando 'Total Fwd Packets' (Alineado/32) para consistencia...")
 
     # --- C) Coherencia Packet Length Mean (despejar Fwd payload y sincronizar) ---
-    if 'Packet Length Mean' in df_base.columns and 'Total Length of Fwd Packets' in df_base.columns:
-        gan_mean   = df_base['Packet Length Mean']
-        bwd_len    = df_base.get('Total Length of Bwd Packets', 0)
-        bwd_pkts   = df_base.get('Total Backward Packets', 0)
-        fwd_pkts   = df_base.get('Total Fwd Packets', pd.Series([1] * len(df_base)))
-        total_pkts = fwd_pkts + bwd_pkts
+    # En vez del bloque C completo, simplemente:
+        # Total Length of Fwd Packets NO lo toques - la GAN no lo modificó,
+        # no hay razón para recalcularlo. Conservar el OLD directamente.
+        df_base['Total Length of Fwd Packets'] = df_full_original['Total Length of Fwd Packets'].values
 
-        new_fwd_len = np.maximum((gan_mean * total_pkts) - bwd_len, 0)
-        new_fwd_len = np.minimum(new_fwd_len, fwd_pkts * 1460)
-
-        df_base['Total Length of Fwd Packets'] = np.round(new_fwd_len).astype(int)
+        # Y recalcular las columnas derivadas desde ese valor conservado:
+        fwd_pkts = df_base['Total Fwd Packets']
+        df_base['Fwd Packet Length Mean'] = df_base['Total Length of Fwd Packets'] / np.maximum(fwd_pkts, 1)
+        df_base['Avg Fwd Segment Size']   = df_base['Fwd Packet Length Mean']
+        # Packet Length Mean sí lo deja modificar la GAN pero recalcúlalo coherentemente:
+        total_pkts = fwd_pkts + df_base['Total Backward Packets']
         df_base['Packet Length Mean'] = (
-            (df_base['Total Length of Fwd Packets'] + bwd_len) / np.maximum(total_pkts, 1)
+            (df_base['Total Length of Fwd Packets'] + df_base['Total Length of Bwd Packets']) 
+            / np.maximum(total_pkts, 1)
         )
-
-        if 'Fwd Packet Length Mean' in df_base.columns:
-            df_base['Fwd Packet Length Mean'] = (
-                df_base['Total Length of Fwd Packets'] / np.maximum(fwd_pkts, 1)
-            )
-        if 'Avg Fwd Segment Size' in df_base.columns:
-            df_base['Avg Fwd Segment Size'] = df_base['Fwd Packet Length Mean']
-        if 'Average Packet Size' in df_base.columns:
-            df_base['Average Packet Size'] = df_base['Packet Length Mean']
-        if 'Fwd Packet Length Max' in df_base.columns and 'Fwd Packet Length Mean' in df_base.columns:
-            df_base['Fwd Packet Length Max'] = np.maximum(
-                df_base['Fwd Packet Length Max'], df_base['Fwd Packet Length Mean']).astype(int)
-        if 'Max Packet Length' in df_base.columns and 'Fwd Packet Length Max' in df_base.columns:
-            df_base['Max Packet Length'] = np.maximum(
-                df_base['Max Packet Length'], df_base['Fwd Packet Length Max']).astype(int)
 
         print("    -> [PAYLOAD] Payload y columnas hermanas sincronizadas.")
 

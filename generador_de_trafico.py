@@ -124,10 +124,7 @@ def filtrar_flujos_generables(df: pd.DataFrame) -> pd.DataFrame:
         & (df["Flow Packets/s"] < 1e9)
         & ~((df["Flow Duration"] == 0) & (df["Total Fwd Packets"] > 1))
         & (df["Flow IAT Min"] >= 0)
-        & ~(
-            (df["Total Length of Fwd Packets"] == 0)
-            & (df["SYN Flag Count"] == 0)
-        )
+        & (df["Total Fwd Packets"] > 0)
     )
 
     df_ok = df[mask_ok].copy().reset_index(drop=True)
