@@ -403,6 +403,11 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
     for col in SHAP_FEATURES:
         df_base[col] = df_shap_fixed[col].values
 
+    # Fallo 3 — Avg Bwd Segment Size es físicamente idéntica a Bwd Packet Length Mean;
+    # la GAN las modifica por separado porque ambas están en LIMITES_FISICOS,
+    # así que forzamos la igualdad después del injerto.
+    df_base['Avg Bwd Segment Size'] = df_base['Bwd Packet Length Mean']
+
     # 5. CÁLCULO INVERSO para coherencia física
 
     # --- A) Coherencia Backward ---
@@ -525,6 +530,20 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
         print("    -> [IAT] Flow Duration escalado desde original × ratio_IAT "
               "(sin herencia de incoherencias del dataset).")
 
+        # Fallo 2 — El bloque D garantiza Max ≥ ceil(Mean) solo para Fwd/Bwd IAT,
+        # pero no para el Flow IAT Max/Min global. Se añade aquí tras actualizar
+        # Flow IAT Mean con el nuevo valor escalado.
+        if 'Flow IAT Max' in df_base.columns:
+            df_base['Flow IAT Max'] = np.maximum(
+                df_base['Flow IAT Max'],
+                np.ceil(df_base['Flow IAT Mean'])
+            ).astype(int)
+        if 'Flow IAT Min' in df_base.columns:
+            df_base['Flow IAT Min'] = np.minimum(
+                df_base['Flow IAT Min'],
+                np.floor(df_base['Flow IAT Mean'])
+            ).astype(int)
+
     # --- E) RECALCULAR VELOCIDADES ---
     # Flow Packets/s = Total Packets / (Flow Duration en segundos)
     # Flow Bytes/s   = Total Bytes   / (Flow Duration en segundos)
@@ -568,6 +587,24 @@ def reparar_y_reconstruir(df_full_original, df_shap_original, df_shap_modificado
         if 'Max Packet Length' in df_base.columns and 'Fwd Packet Length Max' in df_base.columns:
             df_base['Max Packet Length'] = np.maximum(
                 df_base['Max Packet Length'], df_base['Fwd Packet Length Max']).astype(int)
+        # Fallo 1 — El bloque F solo sincronizaba Max Packet Length con Fwd Packet Length Max,
+        # ignorando el lado backward. La GAN puede subir Bwd Packet Length Max por encima de
+        # Max Packet Length, así que lo propagamos aquí.
+        if 'Bwd Packet Length Max' in df_base.columns and 'Max Packet Length' in df_base.columns:
+            df_base['Max Packet Length'] = np.maximum(
+                df_base['Max Packet Length'],
+                df_base['Bwd Packet Length Max']
+            ).astype(int)
+        # Fallo 4 — El bloque F garantiza Fwd Min ≤ Mean ≤ Max, pero no aplica lo mismo
+        # al Min Packet Length global. Se cubre con ambos nombres de columna posibles
+        # ('Packet Length Min' y 'Min Packet Length') para compatibilidad con distintas
+        # versiones del dataset.
+        for min_col in ('Packet Length Min', 'Min Packet Length'):
+            if min_col in df_base.columns:
+                df_base[min_col] = np.minimum(
+                    df_base[min_col],
+                    df_base['Packet Length Mean']
+                ).astype(int)
         print("    -> [FWD HIER] Invariante Fwd Min ≤ Mean ≤ Max garantizada.")
 
     # 6. SANITIZACIÓN FINAL

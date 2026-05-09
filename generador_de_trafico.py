@@ -609,7 +609,8 @@ def procesar_flujo(flujo: pd.Series, t0: float,
     label_safe = (str(flujo.get("Label", "unknown"))
                   .replace(" ", "_").replace("/", "_")
                   .encode("ascii", "ignore").decode())
-    nombre = f"flujo_{label_safe}_{int(t0)}.pcap"
+    origin_idx = str(flujo.get("_ORIGIN_IDX_", "noIdx")).replace(" ", "")
+    nombre = f"flujo_{label_safe}_{origin_idx}_{int(t0)}.pcap"
     ruta   = os.path.join(directorio, nombre)
 
     pkts = construir_paquetes(flujo, t0)

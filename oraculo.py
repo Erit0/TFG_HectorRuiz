@@ -10,7 +10,7 @@ import numpy as np
 CARPETA_FLOWS = 'flows'
 MODELO_VICTIMA_PATH = 'random_forest_cic17_best.pkl'
 ENCODER_PATH = 'label_encoder.pkl'
-SCALER_PATH = 'scaler.pkl'  # <-- IMPORTANTE: Cargar el escalador original
+SCALER_PATH = 'scaler.pkl'  # <-- IMPORTANTE: Cargar el escalador original si se usa
 ARCHIVO_REPORTE_FINAL = 'REPORTE_GLOBAL_PREDICCIONES.csv'
 
 columnas_basura = [
