@@ -14,4 +14,4 @@ hasta la creación de tráfico sintético camuflado para evadir un Random Forest
 Orden de ejecución:
 Prueba_GAN+camuflaje.py -> generador_de_trafico.py -> oraculo.py
 
-El resto de ficheros sirven para análisis y selección de características a modificar.
+El resto de ficheros sirven para análisis y selección de características a modificar. 
