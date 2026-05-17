@@ -39,15 +39,15 @@ FACTOR_PENALIZACION = 1
 LIMITES_FISICOS = {
     'Init_Win_bytes_forward':   65535.0,
     'Init_Win_bytes_backward':      0.0,
-    'Bwd Packet Length Min':        2.0,
+    'Bwd Packet Length Min':        0.0,
     'Fwd Header Length':          40.0,
-    'Bwd Packet Length Std':       10.0,
-    'Bwd Packet Length Mean':       5.0,
-    'Avg Bwd Segment Size':         5.0,
-    'Bwd Packet Length Max':       10.0,
+    'Bwd Packet Length Std':       0.0,
+    'Bwd Packet Length Mean':       0.0,
+    'Avg Bwd Segment Size':         0.0,
+    'Bwd Packet Length Max':       0.0,
     'Packet Length Mean':         100.0,
     'Max Packet Length':           10.0,
-    'Total Length of Bwd Packets': 8.0,
+    'Total Length of Bwd Packets': 0.0,
     'Flow IAT Mean':             100.0,
 }
 
