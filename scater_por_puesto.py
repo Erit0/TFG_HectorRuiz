@@ -42,7 +42,6 @@ def generar_scatter_rank_shap_vs_rf():
         'RST Flag Count': 0.0000
     }
 
-    # Calcular rankings (1 = mayor porcentaje)
     features = list(set(shap_data.keys()) & set(rf_data.keys()))
 
     shap_sorted = sorted(features, key=lambda f: shap_data[f], reverse=True)
@@ -57,14 +56,20 @@ def generar_scatter_rank_shap_vs_rf():
     r2 = r2_score(x_vals, y_vals)
     print(f"R² (rankings): {r2:.4f}")
 
-    # Scatter
+    # Solo estas 4 variables llevan etiqueta
+    labeled = {
+        'Init_Win_bytes_forward',
+        'Init_Win_bytes_backward',
+        'Bwd Packet Length Min',
+        'Fwd Header Length'
+    }
+
     plt.figure(figsize=(10, 8))
     plt.scatter(x_vals, y_vals, color='royalblue', alpha=0.8, edgecolors='black', s=60)
 
-    # Etiquetar puntos con mayor discrepancia o más importantes
     for f in features:
         x, y = shap_rank[f], rf_rank[f]
-        if x <= 5 or y <= 5 or abs(x - y) >= 20:
+        if f in labeled:
             plt.annotate(
                 f,
                 (x, y),
@@ -75,7 +80,6 @@ def generar_scatter_rank_shap_vs_rf():
                 bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.3)
             )
 
-    # Línea de concordancia perfecta (rank SHAP = rank RF)
     max_rank = len(features)
     plt.plot([1, max_rank], [1, max_rank], color='crimson', linestyle='--',
              label='Línea de Concordancia (Rank SHAP = Rank RF)')
